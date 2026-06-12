@@ -1,0 +1,16 @@
+# Credentials & sensitive config
+.env
+*.pem
+*.key
+
+# Results & logs (contain account data)
+results.json
+success.json
+logs/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
