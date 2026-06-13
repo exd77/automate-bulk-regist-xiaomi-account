@@ -1,20 +1,43 @@
+#!/usr/bin/env node
 /**
- * Xiaomi Bulk Registration — Browserless HTTP-only
- * Flow: FLOW.md (8 langkah)
- * + Telegram notification on success
- * + Referral code application post-registration
+ * Xiaomi MiMo Bulk Registration Bot — v2.0 (Chain Referral Edition)
+ *
+ * Hybrid approach:
+ *   - Registration: HTTP-only (fast, no browser overhead)
+ *   - Post-reg: Playwright with fingerprint + humanization
+ *     (referral binding, invite redemption, API key creation, Ultraspeed form)
+ *
+ * Chain referral mode: each account's refCode seeds the next iteration.
+ *
+ * Features ported from mimo-auto-reg (adrapier03):
+ *   ✓ Fingerprint noise (canvas/WebGL/audio) for Playwright
+ *   ✓ Humanized interactions (per-char typing, hover-before-click)
+ *   ✓ Invite code redemption + balance verification
+ *   ✓ API key creation per account
+ *   ✓ Ultraspeed beta form submission
+ *   ✓ Chain referral loop (refCode propagation)
+ *   ✓ Capsolver Enterprise captcha solving
+ *
+ * Usage:
+ *   node register.mjs [count]
+ *   node register.mjs 5                    # register 5 accounts
+ *   node register.mjs 10 --chain           # chain referral mode
  */
 
 import { readFileSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import forge from 'node-forge';
 import { chromium } from 'playwright';
 import { ImapFlow } from 'imapflow';
 
+// ── Fingerprint & Humanization (from mimo-auto-reg) ──
+import { generateFingerprint, buildInitScript, buildExtraHeaders } from './fingerprint.js';
+import { humanFill, humanFillLocator, humanClick, humanType, humanDelay } from './human.js';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Load .env manually
+// ── Load .env ──
 const envPath = resolve(__dirname, '.env');
 const envObj = {};
 for (const line of readFileSync(envPath, 'utf8').split('\n')) {
@@ -24,26 +47,36 @@ for (const line of readFileSync(envPath, 'utf8').split('\n')) {
   envObj[trimmed.slice(0, idx)] = trimmed.slice(idx + 1);
 }
 
-const TWOCAPTCHA_API_KEY = envObj.TWOCAPTCHA_API_KEY;
+const CAPSOLVER_API_KEY = envObj.CAPSOLVER_API_KEY || envObj.TWOCAPTCHA_API_KEY;
 const GMAIL_USER = envObj.GMAIL_USER;
 const GMAIL_APP_PASSWORD = envObj.GMAIL_APP_PASSWORD;
-// Support multiple domains (comma-separated in .env)
 const DOMAINS = (envObj.DOMAIN || 'batakbersatu.my.id').split(',').map(d => d.trim()).filter(Boolean);
 function pickDomain() { return DOMAINS[Math.floor(Math.random() * DOMAINS.length)]; }
 const TELEGRAM_BOT_TOKEN = envObj.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = envObj.TELEGRAM_CHAT_ID || '';
 const PASSWORD = envObj.PASSWORD || 'Xiaomigey1!';
 const COUNT = envObj.COUNT || '5';
-const REFERRAL_CODE = envObj.REFERRAL_CODE || 'CLAYQ4';
-const REFERRAL_DELAY = parseInt(envObj.REFERRAL_DELAY) || 120;
+const REFERRAL_CODE = envObj.REFERRAL_CODE || 'RJ7ZNA';
+const PROXY_URL = envObj.PROXY_URL || '';
 
-// ─── Proxy Setup ───
-const PROXY_URL = envObj.PROXY_URL || "";
+// Chain referral mode
+const CHAIN_REFERRAL = (envObj.CHAIN_REFERRAL || 'false').toLowerCase() === 'true';
+const CHAIN_SEED = envObj.CHAIN_SEED || REFERRAL_CODE;
+const ULTRASPEED_FORM = (envObj.ULTRASPEED_FORM || 'false').toLowerCase() === 'true';
+const CREATE_API_KEY_FLAG = (envObj.CREATE_API_KEY || 'false').toLowerCase() === 'true';
+
+// CLI flags
+const args = process.argv.slice(2);
+const chainMode = CHAIN_REFERRAL || args.includes('--chain');
+const countArg = args.find(a => !a.startsWith('--'));
+const count = parseInt(countArg) || parseInt(COUNT) || 5;
+
+// ── Proxy Setup ──
 let proxyAgent = null;
 if (PROXY_URL) {
-  const { ProxyAgent } = await import("undici");
+  const { ProxyAgent } = await import('undici');
   proxyAgent = new ProxyAgent({ uri: PROXY_URL });
-  console.log("\x1b[36m⚡ Proxy:\x1b[0m " + PROXY_URL.replace(/:[^:@]+@/, ":***@"));
+  console.log('\x1b[36m⚡ Proxy:\x1b[0m ' + PROXY_URL.replace(/:[^:@]+@/, ':***@'));
 }
 
 async function proxyFetch(url, opts = {}) {
@@ -57,7 +90,7 @@ const CAPTCHA_DATA_KEY = '8027422fb0eb42fbac1b521ec4a7961f';
 const REGISTER_PAGE = 'https://global.account.xiaomi.com/fe/service/register?_locale=en_US&_uRegion=ID&ref=CLAYQ4';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ─── RSA Public Keys ───
+// ── RSA Public Keys ──
 const CAPTCHA_RSA_PEM = [
   '-----BEGIN PUBLIC KEY-----',
   'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArxfNLkuAQ/BYHzkzVwtu',
@@ -79,7 +112,7 @@ const EUI_RSA_PEM = [
   '-----END PUBLIC KEY-----'
 ].join('\n');
 
-// ─── Fingerprint Payload ───
+// ── Fingerprint Payload ──
 function buildPayload() {
   const now = Date.now();
   return {
@@ -112,7 +145,7 @@ function buildPayload() {
   };
 }
 
-// ─── Crypto ───
+// ── Crypto ──
 function randomAesKey(len = 16) { return forge.random.getBytesSync(len); }
 
 function encryptSD(payload) {
@@ -146,7 +179,7 @@ function encryptEUI(email, password) {
   return { eui, encEmail, encPass };
 }
 
-// ─── Step 2: Init Captcha ───
+// ── Step 2: Init Captcha ──
 async function initCaptcha() {
   const { s, d } = encryptSD(buildPayload());
   const params = new URLSearchParams({ s, d, a: 'register' });
@@ -163,12 +196,12 @@ async function initCaptcha() {
   return eToken;
 }
 
-// ─── Step 3: Solve reCAPTCHA (parallel race — 2 tasks) ───
+// ── Step 3: Solve reCAPTCHA (Capsolver) ──
 async function createCaptchaTask(eToken) {
   const resp = await (await proxyFetch('https://api.capsolver.com/createTask', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      clientKey: TWOCAPTCHA_API_KEY,
+      clientKey: CAPSOLVER_API_KEY,
       task: {
         type: 'RecaptchaV2EnterpriseTaskProxyless',
         websiteURL: REGISTER_PAGE,
@@ -178,23 +211,22 @@ async function createCaptchaTask(eToken) {
       languagePool: 'en'
     })
   })).json();
-  if (resp.errorId) throw new Error('2captcha create: ' + resp.errorDescription);
+  if (resp.errorId) throw new Error('capsolver create: ' + resp.errorDescription);
   return resp.taskId;
 }
 
 async function pollCaptchaTask(taskId) {
   const poll = await (await proxyFetch('https://api.capsolver.com/getTaskResult', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ clientKey: TWOCAPTCHA_API_KEY, taskId })
+    body: JSON.stringify({ clientKey: CAPSOLVER_API_KEY, taskId })
   })).json();
   return poll;
 }
 
 async function solveCaptcha(eToken) {
-  // Adaptive strategy: start with 1 task, spawn backup after 30s if still unsolved
-  const BACKUP_AFTER = 30; // seconds before spawning backup task
-  const POLL_INTERVAL = 3; // seconds between polls
-  const MAX_WAIT = 180; // max total seconds
+  const BACKUP_AFTER = 30;
+  const POLL_INTERVAL = 3;
+  const MAX_WAIT = 180;
 
   const taskIds = [];
   const firstId = await createCaptchaTask(eToken);
@@ -208,17 +240,15 @@ async function solveCaptcha(eToken) {
     await sleep(POLL_INTERVAL * 1000);
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
-    // Spawn backup task after BACKUP_AFTER seconds
     if (!backupSpawned && elapsed >= BACKUP_AFTER) {
       try {
         const backupId = await createCaptchaTask(eToken);
         taskIds.push(backupId);
         backupSpawned = true;
         log(`      ├─ ⏱️  ${elapsed}s elapsed — backup task #${backupId} spawned`);
-      } catch { /* ignore backup creation failure */ }
+      } catch { /* ignore */ }
     }
 
-    // Poll all active tasks
     for (let t = taskIds.length - 1; t >= 0; t--) {
       try {
         const poll = await pollCaptchaTask(taskIds[t]);
@@ -227,7 +257,7 @@ async function solveCaptcha(eToken) {
           return poll.solution.gRecaptchaResponse;
         }
         if (poll.errorId && poll.errorCode !== 'CAPCHA_NOT_READY') {
-          throw new Error('2captcha poll: ' + poll.errorDescription);
+          throw new Error('capsolver poll: ' + poll.errorDescription);
         }
       } catch (e) {
         taskIds.splice(t, 1);
@@ -235,10 +265,10 @@ async function solveCaptcha(eToken) {
       }
     }
   }
-  throw new Error('2captcha timeout');
+  throw new Error('capsolver timeout');
 }
 
-// ─── Step 4: Verify captcha → vToken ───
+// ── Step 4: Verify captcha → vToken ──
 async function verifyCaptcha(eToken, gToken) {
   const url = `https://verify.sec.xiaomi.com/captcha/v2/recaptcha/verify?k=${CAPTCHA_DATA_KEY}&locale=en_US&_t=${Date.now()}`;
   const resp = await proxyFetch(url, {
@@ -251,7 +281,7 @@ async function verifyCaptcha(eToken, gToken) {
   return json.data.token;
 }
 
-// ─── Steps 2-4 combined with retry ───
+// ── Steps 2-4 combined with retry ──
 async function getCaptchaToken() {
   for (let attempt = 1; attempt <= 4; attempt++) {
     log(`   🔐 Captcha attempt ${attempt}/4`);
@@ -267,7 +297,7 @@ async function getCaptchaToken() {
   return null;
 }
 
-// ─── Step 6: Send verification email ───
+// ── Step 6: Send verification email ──
 async function sendVerifyEmail(email, password, vToken) {
   const { eui, encEmail, encPass } = encryptEUI(email, password);
   const deviceId = 'wb_' + forge.util.bytesToHex(forge.random.getBytesSync(16));
@@ -284,7 +314,6 @@ async function sendVerifyEmail(email, password, vToken) {
   const text = await resp.text();
   let data;
   try { data = JSON.parse(text.replace(/^&&&START&&&/, '')); } catch { data = { raw: text }; }
-  // Capture cookies from set-cookie headers (passToken, serviceToken, userId)
   const setCookies = [];
   resp.headers.forEach((val, key) => { if (key === 'set-cookie') setCookies.push(val); });
   for (const c of setCookies) {
@@ -299,14 +328,14 @@ async function sendVerifyEmail(email, password, vToken) {
   return data;
 }
 
-// ─── Step 7: Read code via IMAP ───
+// ── Step 7: Read code via IMAP ──
 async function readCode(toEmail, timeoutSec = 300) {
   const deadline = Date.now() + timeoutSec * 1000;
-  const sentAfter = new Date(Date.now() - 10 * 60 * 1000); // emails from last 10 min (wider window)
+  const sentAfter = new Date(Date.now() - 10 * 60 * 1000);
   let client;
   let pollCount = 0;
   const toEmailLower = toEmail.toLowerCase();
-  const emailUser = toEmailLower.split('@')[0]; // local part for fuzzy match
+  const emailUser = toEmailLower.split('@')[0];
 
   try {
     client = new ImapFlow({
@@ -314,7 +343,7 @@ async function readCode(toEmail, timeoutSec = 300) {
       auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
       logger: false, maxConnections: 1, disableAutoIdle: true
     });
-    client.on("error", () => {});
+    client.on('error', () => {});
     await client.connect();
 
     while (Date.now() < deadline) {
@@ -327,7 +356,6 @@ async function readCode(toEmail, timeoutSec = 300) {
           { envelope: true, source: true, uid: true }
         )) msgs.push(m);
 
-        // Debug: show what we found on first poll
         if (pollCount === 1 && msgs.length > 0) {
           const aliases = msgs.map(m => m.envelope?.to?.[0]?.address || '?').slice(0, 5);
           log(`      📭 Found ${msgs.length} Xiaomi email(s): ${aliases.join(', ')}${msgs.length > 5 ? '...' : ''}`);
@@ -337,7 +365,6 @@ async function readCode(toEmail, timeoutSec = 300) {
           const raw = m.source?.toString('utf8') || '';
           const rawLower = raw.toLowerCase();
 
-          // Multi-source alias matching (envelope, headers, body)
           const envelopeTo = (m.envelope?.to || []).map(a => a.address?.toLowerCase()).join(',');
           const rawToHeader = (raw.match(/^To:\s*(.+)/mi)?.[1] || '').toLowerCase();
           const rawDeliveredTo = (raw.match(/^Delivered-To:\s*(.+)/mi)?.[1] || '').toLowerCase();
@@ -346,7 +373,7 @@ async function readCode(toEmail, timeoutSec = 300) {
             || rawToHeader.includes(toEmailLower)
             || rawDeliveredTo.includes(toEmailLower)
             || rawLower.includes(toEmailLower)
-            || rawLower.includes(emailUser); // fuzzy: match local part anywhere in body
+            || rawLower.includes(emailUser);
           if (!isMatch) continue;
 
           const body = raw
@@ -372,7 +399,6 @@ async function readCode(toEmail, timeoutSec = 300) {
       await sleep(3000);
     }
 
-    // Timeout debug: show what emails exist
     log(`      🔍 Debug: polled ${pollCount}x over ${timeoutSec}s, checking aliases for: ${toEmailLower}`);
   } catch (e) {
     log(`      ⚠️  IMAP error: ${e.message.slice(0, 60)}`);
@@ -382,7 +408,7 @@ async function readCode(toEmail, timeoutSec = 300) {
   return null;
 }
 
-// ─── Step 8: Verify & create account ───
+// ── Step 8: Verify & create account ──
 async function verifyAccount(email, password, code) {
   const { eui, encEmail, encPass } = encryptEUI(email, password);
   const fp = forge.util.bytesToHex(forge.random.getBytesSync(16));
@@ -403,7 +429,6 @@ async function verifyAccount(email, password, code) {
   const text = await resp.text();
   let data;
   try { data = JSON.parse(text.replace(/^&&&START&&&/, '')); } catch { data = { raw: text }; }
-  // Capture cookies from set-cookie headers (passToken, serviceToken, userId)
   const setCookies = [];
   resp.headers.forEach((val, key) => { if (key === 'set-cookie') setCookies.push(val); });
   for (const c of setCookies) {
@@ -418,144 +443,811 @@ async function verifyAccount(email, password, code) {
   return data;
 }
 
-// ─── Step 9: Apply Referral (Playwright-based) ───
-// Must use Playwright because:
-// 1. agreement must be accepted before bind
-// 2. httpOnly cookies (api-platform_serviceToken) can't be sent via raw HTTP
-// 3. credentials: "same-origin" in page.evaluate handles httpOnly cookies automatically
-async function applyReferral(passToken, userId) {
-  if (!REFERRAL_CODE) return { skipped: true };
-  let browser;
-  try {
+// ══════════════════════════════════════════════════════════════════════════
+// PLAYWRIGHT POST-REGISTRATION SESSION
+// Handles: SSO login, agreement, invite redemption, referral extraction,
+//          API key creation, Ultraspeed form — all with fingerprint + humanization
+// ══════════════════════════════════════════════════════════════════════════
+
+class PostRegSession {
+  constructor(passToken, userId, inviteCode) {
+    this.passToken = passToken;
+    this.userId = userId;
+    this.inviteCode = inviteCode;
+    this.browser = null;
+    this.page = null;
+    this.context = null;
+    this.fingerprint = null;
+    this.refCode = null;
+    this.apiKey = null;
+    this.balance = null;
+  }
+
+  async launch() {
+    // Generate random fingerprint
+    const fp = generateFingerprint();
+    this.fingerprint = fp;
+    log(`      ├─ 🌐 Browser: Chrome ${fp.chromeMajor}, ${fp.viewport.width}x${fp.viewport.height}`);
+
     // Parse proxy for Playwright
     let pwProxy = undefined;
     if (PROXY_URL) {
       try {
         const pu = new URL(PROXY_URL);
-        pwProxy = { server: pu.protocol + "//" + pu.hostname + ":" + pu.port, username: pu.username, password: pu.password };
+        pwProxy = { server: pu.protocol + '//' + pu.hostname + ':' + pu.port, username: pu.username, password: pu.password };
       } catch {}
     }
-    browser = await chromium.launch({ headless: true, proxy: pwProxy });
 
-    // Randomized viewport & locale to look more human
-    const viewports = [
-      { width: 1366, height: 768 }, { width: 1440, height: 900 },
-      { width: 1536, height: 864 }, { width: 1920, height: 1080 }
-    ];
-    const vp = viewports[Math.floor(Math.random() * viewports.length)];
-    const context = await browser.newContext({
-      viewport: vp, userAgent: UA,
-      locale: 'en-US', timezoneId: 'Asia/Jakarta',
+    this.browser = await chromium.launch({
+      headless: true,
+      proxy: pwProxy,
+      args: [
+        `--window-size=${fp.viewport.width},${fp.viewport.height}`,
+        '--disable-blink-features=AutomationControlled',
+      ],
     });
 
-    // Set passToken cookies on account.xiaomi.com
-    await context.addCookies([
-      { name: "passToken", value: passToken, domain: "account.xiaomi.com", path: "/" },
-      { name: "userId", value: userId, domain: "account.xiaomi.com", path: "/" },
+    this.context = await this.browser.newContext({
+      userAgent: fp.userAgent,
+      viewport: fp.viewport,
+      deviceScaleFactor: fp.deviceScaleFactor,
+      locale: fp.locale,
+      timezoneId: fp.timezone,
+      screen: { width: fp.screen.width, height: fp.screen.height },
+      extraHTTPHeaders: buildExtraHeaders(fp),
+    });
+
+    // Inject fingerprint overrides before page code runs
+    await this.context.addInitScript({ content: buildInitScript(fp) });
+
+    // Set passToken cookies
+    await this.context.addCookies([
+      { name: 'passToken', value: this.passToken, domain: 'account.xiaomi.com', path: '/' },
+      { name: 'userId', value: this.userId, domain: 'account.xiaomi.com', path: '/' },
     ]);
 
-    const page = await context.newPage();
-    const humanDelay = () => page.waitForTimeout(2000 + Math.floor(Math.random() * 4000));
-    const humanMouse = () => page.mouse.move(
-      200 + Math.floor(Math.random() * 600),
-      150 + Math.floor(Math.random() * 400)
-    );
+    this.page = await this.context.newPage();
 
-    // Step 1: SSO login — navigate to console (triggers SSO redirect chain)
-    log('      ├─ SSO login → platform console...');
-    await page.goto("https://platform.xiaomimimo.com/console", { waitUntil: "networkidle", timeout: 60000 });
-    await humanDelay();
-    await humanMouse();
-    await humanDelay();
+    // Suppress console noise
+    this.page.on('console', msg => {
+      const txt = msg.text();
+      if (txt.includes('error') || txt.includes('failed')) {
+        log(`      │  [console] ${txt.substring(0, 100)}`);
+      }
+    });
+  }
 
-    // Step 2: Accept agreement (GET /api/v1/agreement)
-    log('      ├─ Accepting agreement...');
-    const agrResult = await page.evaluate(async () => {
-      const res = await fetch("/api/v1/agreement", {
-        method: "GET", credentials: "same-origin",
-        headers: { "Accept": "application/json", "x-timeZone": "Asia/Jakarta" }
+  async close() {
+    if (this.browser) await this.browser.close().catch(() => {});
+  }
+
+  // ── SSO Login ──
+  async ssoLogin() {
+    log(`      ├─ 🔐 SSO login → platform...`);
+    await this.page.goto('https://platform.xiaomimimo.com/console', {
+      waitUntil: 'networkidle', timeout: 60000
+    });
+    await humanDelay(1500, 3000);
+
+    // Handle OAuth redirect if needed
+    const currentUrl = this.page.url();
+    if (currentUrl.includes('account.xiaomi.com') || currentUrl.includes('login') || currentUrl.includes('auth')) {
+      log(`      ├─ OAuth redirect detected, authorizing...`);
+      await this.page.waitForTimeout(2000);
+
+      const agreeBtn = await this.page.$('button:has-text("Agree"), .miui-modal-wrap button:has-text("Agree")');
+      if (agreeBtn) {
+        await agreeBtn.click({ force: true });
+        await this.page.waitForTimeout(3000);
+      }
+
+      const authBtn = await this.page.waitForSelector(
+        'button:has-text("Agree"), button:has-text("Authorize"), button:has-text("Sign in"), #accept, .btn-primary',
+        { timeout: 10000 }
+      ).catch(() => null);
+      if (authBtn) {
+        await authBtn.click();
+        await this.page.waitForNavigation({ waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
+        await this.page.waitForTimeout(3000);
+      }
+    }
+    log(`      ├─ ✅ On: ${this.page.url()}`);
+  }
+
+  // ── Accept Agreement ──
+  async acceptAgreement() {
+    log(`      ├─ 📜 Accepting agreement...`);
+    const result = await this.page.evaluate(async () => {
+      const res = await fetch('/api/v1/agreement', {
+        method: 'GET', credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'x-timeZone': 'Asia/Jakarta' }
       });
       return await res.json();
     });
-    log('      ├─ Agreement: ' + (agrResult.code === 0 ? '✓' : 'code=' + agrResult.code));
-    await humanDelay();
+    log(`      ├─ Agreement: ${result.code === 0 ? '✓' : 'code=' + result.code}`);
+    await humanDelay(1000, 2000);
+  }
 
-    // Step 3: Refresh session (re-SSO after agreement — session token changes)
-    log('      ├─ Refreshing session...');
-    await context.addCookies([
-      { name: "passToken", value: passToken, domain: "account.xiaomi.com", path: "/" },
-      { name: "userId", value: userId, domain: "account.xiaomi.com", path: "/" },
-    ]);
-    await page.goto("https://platform.xiaomimimo.com/console", { waitUntil: "networkidle", timeout: 60000 });
-    await humanDelay();
-    await humanMouse();
-    await humanDelay();
-
-    // Step 4: Check eligible
-    const eligible = await page.evaluate(async () => {
-      const res = await fetch("/api/v1/invitation/eligible", {
-        credentials: "same-origin",
-        headers: { "Accept": "application/json" }
+  // ── Handle Terms Modal ──
+  async handleTermsModal() {
+    try {
+      const termsModalOpen = await this.page.evaluate(() => {
+        const wraps = Array.from(document.querySelectorAll('.ant-modal-wrap'));
+        return wraps.some(wrap => {
+          if (wrap.offsetHeight === 0 || wrap.style.display === 'none') return false;
+          const text = (wrap.innerText || '').toLowerCase();
+          return text.includes('agree') || text.includes('terms');
+        });
       });
-      return await res.json();
-    });
-    log('      ├─ Eligible: ' + (eligible?.data?.canBind ? '✓' : '✗'));
+      if (!termsModalOpen) return;
 
-    if (!eligible?.data?.canBind) {
-      log('      └─ ⏭️  Already bound or not eligible');
-      await browser.close();
-      return { status: 'already_bound' };
+      log(`      ├─ Terms modal detected, handling...`);
+      await this.page.evaluate(() => {
+        const modal = Array.from(document.querySelectorAll('.ant-modal-wrap'))
+          .find(w => w.offsetHeight > 0 && w.style.display !== 'none');
+        if (!modal) return;
+        const wrapper = modal.querySelector('.ant-checkbox-wrapper') || modal.querySelector('.ant-checkbox');
+        if (wrapper) wrapper.click();
+      });
+      await this.page.waitForTimeout(800);
+
+      const confirmBtn = await this.page.$('.ant-modal-wrap .ant-btn-primary:not([disabled])');
+      if (confirmBtn) {
+        await confirmBtn.click({ force: true });
+        log(`      ├─ ✓ Terms confirmed`);
+      }
+      await this.page.waitForTimeout(1000);
+    } catch (e) {
+      log(`      ├─ ! Terms modal: ${e.message.slice(0, 60)}`);
+    }
+  }
+
+  // ── Wait for Overlays Gone ──
+  async waitForOverlaysGone(timeout = 6000) {
+    try {
+      await this.page.waitForFunction(() => {
+        const masks = document.querySelectorAll('.ant-modal-mask, .ant-modal-wrap');
+        return Array.from(masks).every(m => {
+          const style = window.getComputedStyle(m);
+          return style.display === 'none' || style.visibility === 'hidden' || m.offsetHeight === 0;
+        });
+      }, { timeout });
+    } catch {}
+  }
+
+  // ── Redeem Invite Code ──
+  async redeemInviteCode() {
+    if (!this.inviteCode) return;
+    log(`      ├─ 🎁 Redeeming invite code: ${this.inviteCode}`);
+
+    // Navigate to balance page
+    await this.page.goto('https://platform.xiaomimimo.com/console/balance', {
+      waitUntil: 'networkidle', timeout: 60000
+    });
+    await this.page.waitForTimeout(2500);
+
+    // Handle redirects
+    await this.handleOAuthRedirect();
+    await this.acceptCookies();
+    await this.handleTermsModal();
+    await this.waitForOverlaysGone();
+
+    // Read balance before
+    const balanceBefore = await this.readBalance();
+    log(`      ├─ 💰 Balance before: $${balanceBefore !== null ? balanceBefore.toFixed(2) : 'unknown'}`);
+
+    // Check if "Enter invite code" exists
+    const linkExists = await this.page.evaluate(() =>
+      document.body.innerText.includes('Enter invite code')
+    ).catch(() => false);
+
+    if (!linkExists) {
+      log(`      ├─ ℹ No "Enter invite code" — likely already redeemed`);
+      return;
     }
 
-    await humanDelay();
-
-    // Step 5: Bind referral via page.evaluate (uses httpOnly cookies automatically)
-    log('      ├─ Binding referral: ' + REFERRAL_CODE);
-    const bindResult = await page.evaluate(async (code) => {
-      const cookies = document.cookie;
-      const phMatch = cookies.match(/api-platform_ph="?([^";\s]+)/);
-      const ph = phMatch ? phMatch[1].replace(/"/g, "") : "";
-
-      const url = `/api/v1/invitation/bind?api-platform_ph=${encodeURIComponent(ph)}`;
-      const res = await fetch(url, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({ inviteCode: code })
+    // Click "Enter invite code"
+    try {
+      const el = this.page.locator('text=Enter invite code').first();
+      await el.waitFor({ state: 'visible', timeout: 8000 });
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await humanDelay(200, 400);
+      await el.hover({ timeout: 3000 }).catch(() => {});
+      await humanDelay(150, 300);
+      await el.click({ timeout: 5000 });
+      log(`      ├─ ✓ Clicked "Enter invite code"`);
+    } catch (e) {
+      // DOM eval fallback
+      await this.page.evaluate(() => {
+        const elements = Array.from(document.querySelectorAll('*'));
+        for (let i = elements.length - 1; i >= 0; i--) {
+          const el = elements[i];
+          const text = (el.textContent || '').trim();
+          if (text.includes('Enter invite code') && el.offsetHeight > 0) {
+            const tagName = el.tagName.toLowerCase();
+            if (['span', 'a', 'button', 'div'].includes(tagName) && el.children.length <= 1) {
+              el.scrollIntoView({ block: 'center' });
+              el.click();
+              return true;
+            }
+          }
+        }
+        return false;
       });
-      return { status: res.status, body: await res.text() };
-    }, REFERRAL_CODE);
+    }
 
-    log('      └─ Bind: ' + (bindResult.status === 200 ? '✓ Success' : '✗ ' + bindResult.status + ' ' + bindResult.body.slice(0, 150)));
+    // Wait for modal
+    await this.page.waitForSelector('.ant-modal, .ant-modal-wrap', { timeout: 10000 }).catch(() => null);
+    await this.page.waitForTimeout(1500);
 
-    await browser.close();
-    return bindResult;
-  } catch (e) {
-    log('      └─ ❌ Error: ' + e.message);
-    if (browser) try { await browser.close(); } catch {}
-    return { error: e.message };
+    // Fill invite code (6-char input boxes or single input)
+    const modalInputs = await this.page.$$('.ant-modal input:not([type="checkbox"]), .ant-modal-wrap input:not([type="checkbox"])');
+    const visibleInputs = [];
+    for (const input of modalInputs) {
+      if (await input.isVisible().catch(() => false)) visibleInputs.push(input);
+    }
+
+    if (visibleInputs.length >= 6) {
+      // 6-box invite code input
+      for (const input of visibleInputs) await input.fill('');
+      await humanDelay(150, 350);
+      await visibleInputs[0].click({ force: true });
+      await visibleInputs[0].focus();
+      await humanDelay(120, 280);
+
+      for (let i = 0; i < 6; i++) {
+        const activeIndex = await this.page.evaluate((els) =>
+          els.indexOf(document.activeElement), visibleInputs
+        );
+        if (activeIndex === i) {
+          await this.page.keyboard.type(this.inviteCode[i], { delay: 60 + Math.floor(Math.random() * 120) });
+        } else {
+          await visibleInputs[i].click({ force: true });
+          await visibleInputs[i].focus();
+          await humanDelay(80, 180);
+          await this.page.keyboard.press('Backspace');
+          await this.page.keyboard.type(this.inviteCode[i], { delay: 60 + Math.floor(Math.random() * 120) });
+        }
+        await humanDelay(180, 380);
+      }
+      log(`      ├─ ✓ Filled 6-box invite code`);
+    } else if (visibleInputs.length > 0) {
+      await humanFill(this.page, visibleInputs[0], this.inviteCode);
+      log(`      ├─ ✓ Filled invite code (single input)`);
+    }
+
+    await this.page.waitForTimeout(1000);
+
+    // Click Redeem button
+    const redeemBtn = await this.page.$('.ant-modal button:has-text("Redeem"), button:has-text("Redeem & get")');
+    if (redeemBtn) {
+      await redeemBtn.click({ force: true });
+      log(`      ├─ ✓ Clicked Redeem`);
+    } else {
+      await this.page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('.ant-modal button'));
+        const target = btns.find(b => b.textContent.includes('Redeem') || b.textContent.includes('get $2'));
+        if (target) target.click();
+      });
+    }
+
+    await this.page.waitForTimeout(4000);
+
+    // Check for restriction
+    const restrictionMsg = await this.page.evaluate(() => {
+      const text = document.body.innerText || '';
+      const patterns = [/risk\s*control\s*restriction/i, /account\s+has\s+risk\s+control/i, /contact\s+customer\s+service/i];
+      for (const re of patterns) {
+        const m = text.match(new RegExp('([^\\n]{0,200}' + re.source + '[^\\n]{0,200})', re.flags));
+        if (m) return m[1].trim();
+      }
+      return null;
+    }).catch(() => null);
+
+    if (restrictionMsg) {
+      log(`      ├─ ❌ ACCOUNT RESTRICTED: ${restrictionMsg.slice(0, 100)}`);
+      return;
+    }
+
+    // Close modal & reload for fresh balance
+    await this.page.keyboard.press('Escape').catch(() => {});
+    await this.page.waitForTimeout(800);
+    await this.page.reload({ waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
+    await this.page.waitForTimeout(2000);
+    await this.handleTermsModal();
+    await this.waitForOverlaysGone();
+
+    const balanceAfter = await this.readBalance();
+    log(`      ├─ 💰 Balance after:  $${balanceAfter !== null ? balanceAfter.toFixed(2) : 'unknown'}`);
+
+    if (balanceBefore !== null && balanceAfter !== null) {
+      const delta = balanceAfter - balanceBefore;
+      if (delta >= 1.5) {
+        log(`      ├─ ✅ Balance verified: +$${delta.toFixed(2)}`);
+      } else if (delta > 0) {
+        log(`      ├─ ⚠ Partial credit: +$${delta.toFixed(2)}`);
+      } else {
+        log(`      ├─ ❌ Balance did NOT increase`);
+      }
+    }
+    this.balance = balanceAfter;
+  }
+
+  // ── Get Referral Code ──
+  async getReferralCode() {
+    log(`      ├─ 🔗 Fetching referral code...`);
+
+    // Make sure we're on balance page
+    if (!this.page.url().includes('/console/balance')) {
+      await this.page.goto('https://platform.xiaomimimo.com/console/balance', {
+        waitUntil: 'networkidle', timeout: 60000
+      }).catch(() => {});
+      await this.handleOAuthRedirect();
+      await this.handleTermsModal();
+      await this.waitForOverlaysGone();
+      await humanDelay(1500, 2500);
+    }
+
+    // Strategy 1: Scan ?ref= in links/anchors
+    let refCode = await this.page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a, [data-href], [data-clipboard-text]'));
+      for (const a of anchors) {
+        const href = a.href || a.getAttribute('data-href') || a.getAttribute('data-clipboard-text') || '';
+        const m = href.match(/[?&]ref=([A-Z0-9]{6})\b/i);
+        if (m) return m[1].toUpperCase();
+      }
+      return null;
+    });
+    if (this.isValidRefCode(refCode)) {
+      log(`      ├─ ✓ Ref code (link): ${refCode}`);
+      this.refCode = refCode;
+      return refCode;
+    }
+
+    // Strategy 2: Page text scan
+    refCode = await this.page.evaluate(() => {
+      const text = document.body.innerText;
+      const m1 = text.match(/[?&]ref=([A-Z0-9]{6})\b/i);
+      if (m1) return m1[1].toUpperCase();
+      const m2 = text.match(/(?:invite\s+code|referral\s+code|your\s+code)[\s:\n]+([A-Z0-9]{6})\b/i);
+      if (m2) return m2[1].toUpperCase();
+      return null;
+    });
+    if (this.isValidRefCode(refCode)) {
+      log(`      ├─ ✓ Ref code (text): ${refCode}`);
+      this.refCode = refCode;
+      return refCode;
+    }
+
+    // Strategy 3: Click Refer & earn → modal → scan
+    const opened = await this.page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+      const target = all.find(el => {
+        const txt = (el.textContent || '').trim();
+        return /^(Refer\s*&\s*earn|Invite|Share)/i.test(txt) && el.offsetHeight > 0;
+      });
+      if (target) { target.click(); return true; }
+      return false;
+    });
+
+    if (opened) {
+      await this.page.waitForTimeout(2000);
+      await humanDelay(800, 1400);
+
+      // Try reading from modal + clipboard
+      for (let attempt = 1; attempt <= 3 && !refCode; attempt++) {
+        refCode = await this.page.evaluate(() => {
+          const modal = Array.from(document.querySelectorAll('.ant-modal, .ant-modal-content, [role="dialog"]'))
+            .find(m => m.offsetHeight > 0);
+          const scope = modal || document.body;
+          const els = Array.from(scope.querySelectorAll('a, [data-clipboard-text], input, textarea'));
+          for (const el of els) {
+            const sources = [el.href, el.value, el.getAttribute('data-clipboard-text'), el.textContent];
+            for (const s of sources) {
+              if (!s) continue;
+              const m = s.match(/[?&]ref=([A-Z0-9]{6})\b/i);
+              if (m) return m[1].toUpperCase();
+            }
+          }
+          const text = scope.innerText || '';
+          const m1 = text.match(/[?&]ref=([A-Z0-9]{6})\b/i);
+          if (m1) return m1[1].toUpperCase();
+          const m2 = text.match(/(?:invite\s+code|referral\s+code)[\s:\n]+([A-Z0-9]{6})\b/i);
+          if (m2) return m2[1].toUpperCase();
+          return null;
+        });
+        if (!this.isValidRefCode(refCode)) {
+          refCode = null;
+          if (attempt < 3) await humanDelay(1200, 1800);
+        }
+      }
+
+      // Clipboard fallback
+      if (!refCode) {
+        try {
+          const ctx = this.page.context();
+          await ctx.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
+          await this.page.evaluate(() => {
+            const modal = Array.from(document.querySelectorAll('.ant-modal, [role="dialog"]'))
+              .find(m => m.offsetHeight > 0);
+            if (!modal) return;
+            const btns = Array.from(modal.querySelectorAll('button'));
+            const copy = btns.find(b => /^(copy|copy link)/i.test((b.textContent || '').trim()));
+            if (copy) copy.click();
+          });
+          await humanDelay(900, 1400);
+          const clipText = await this.page.evaluate(async () => {
+            try { return await navigator.clipboard.readText(); } catch { return ''; }
+          });
+          if (clipText) {
+            const m = clipText.match(/[?&]ref=([A-Z0-9]{6})\b/i);
+            if (m && this.isValidRefCode(m[1])) refCode = m[1].toUpperCase();
+            else if (this.isValidRefCode(clipText.trim())) refCode = clipText.trim().toUpperCase();
+          }
+        } catch {}
+      }
+
+      await this.page.keyboard.press('Escape').catch(() => {});
+    }
+
+    if (this.isValidRefCode(refCode)) {
+      log(`      ├─ ✓ Ref code: ${refCode}`);
+      this.refCode = refCode;
+      return refCode;
+    }
+
+    log(`      ├─ ⚠ Ref code not found`);
+    return null;
+  }
+
+  isValidRefCode(s) {
+    if (!s) return false;
+    const up = String(s).toUpperCase().trim();
+    const blacklist = ['YOUR', 'CODE', 'INVITE', 'REFERRAL', 'ENTER', 'COPY', 'SHARE', 'EARN', 'NULL', 'NONE', 'TRUE', 'FALSE'];
+    if (up.length !== 6) return false;
+    if (blacklist.includes(up)) return false;
+    return /^[A-Z0-9]{6}$/.test(up);
+  }
+
+  // ── Read Balance ──
+  async readBalance() {
+    try {
+      return await this.page.evaluate(() => {
+        const text = document.body.innerText || '';
+        const lines = text.split(/\r?\n/);
+        for (let i = 0; i < lines.length - 1; i++) {
+          if (/^balance$/i.test(lines[i].trim())) {
+            for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+              const m = lines[j].match(/\$\s*([0-9]+\.[0-9]{2})/);
+              if (m) return parseFloat(m[1]);
+            }
+          }
+        }
+        const bonus = text.match(/bonus\s+balance\s*[:\s]\s*\$\s*([0-9]+\.[0-9]{2})/i);
+        const cash = text.match(/cash\s+balance\s*[:\s]\s*\$\s*([0-9]+\.[0-9]{2})/i);
+        if (bonus && cash) return parseFloat(bonus[1]) + parseFloat(cash[1]);
+        if (bonus) return parseFloat(bonus[1]);
+        return null;
+      });
+    } catch { return null; }
+  }
+
+  // ── Create API Key ──
+  async createApiKey() {
+    log(`      ├─ 🔑 Creating API key...`);
+    await this.page.goto('https://platform.xiaomimimo.com/console/api-keys', {
+      waitUntil: 'networkidle', timeout: 60000
+    });
+    await this.page.waitForTimeout(4000);
+    await this.handleOAuthRedirect();
+    await this.handleTermsModal();
+    await this.waitForOverlaysGone();
+
+    // Check existing key
+    const existing = await this.page.evaluate(() => {
+      const text = document.body.innerText;
+      const m = text.match(/sk-[a-zA-Z0-9_\-]{6,}(?:\.{3}[a-zA-Z0-9_\-]{3,})?/);
+      return m ? m[0] : null;
+    }).catch(() => null);
+
+    if (existing) {
+      log(`      ├─ ℹ Existing API key: ${existing}`);
+      this.apiKey = existing;
+      return existing;
+    }
+
+    // Click Create API Key
+    const createBtn = await this.page.$('button:has-text("Create API Key")');
+    if (createBtn) {
+      await createBtn.click({ force: true });
+    } else {
+      await this.page.evaluate(() => {
+        const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Create API Key'));
+        if (btn) btn.click();
+      });
+    }
+    await this.page.waitForTimeout(2000);
+
+    // Fill name
+    const nameInput = await this.page.waitForSelector('.ant-modal input[placeholder="Please enter"], .ant-modal-body input', { timeout: 5000 }).catch(() => null);
+    if (nameInput) {
+      await humanFill(this.page, nameInput, 'mykey');
+    }
+    await humanDelay(250, 500);
+
+    // Confirm
+    const confirmBtn = await this.page.$('.ant-modal-footer button.ant-btn-primary, .ant-modal button:has-text("Confirm")');
+    if (confirmBtn) await confirmBtn.click({ force: true });
+    await this.page.waitForTimeout(4000);
+
+    // Extract key
+    const apiKey = await this.page.evaluate(() => {
+      const modals = Array.from(document.querySelectorAll('.ant-modal-wrap, .ant-modal, .ant-notification'));
+      for (const modal of modals) {
+        const m = (modal.innerText || '').match(/sk-[a-zA-Z0-9_\-]+/);
+        if (m) return m[0];
+      }
+      const bodyMatch = document.body.innerText.match(/sk-[a-zA-Z0-9_\-]+/);
+      return bodyMatch ? bodyMatch[0] : null;
+    });
+
+    if (apiKey) {
+      log(`      ├─ ✓ API key: ${apiKey}`);
+      this.apiKey = apiKey;
+    } else {
+      log(`      ├─ ⚠ Failed to extract API key`);
+    }
+
+    // Close modal
+    const closeBtn = await this.page.$('.ant-modal-wrap button:has-text("OK"), .ant-modal-wrap button:has-text("Close")');
+    if (closeBtn) await closeBtn.click().catch(() => {});
+    else await this.page.keyboard.press('Escape').catch(() => {});
+    await this.page.waitForTimeout(1000);
+
+    return apiKey;
+  }
+
+  // ── Fill Ultraspeed Form ──
+  async fillUltraspeedForm(email) {
+    log(`      ├─ ⚡ Filling Ultraspeed beta form...`);
+    await this.page.goto('https://platform.xiaomimimo.com/ultraspeed', {
+      waitUntil: 'networkidle', timeout: 60000
+    });
+    await this.page.waitForTimeout(5000);
+    await this.handleOAuthRedirect();
+    await this.acceptCookies();
+    await this.handleTermsModal();
+    await this.waitForOverlaysGone();
+
+    // Generate random data
+    const firstNames = ['Adit', 'Bintang', 'Rian', 'Bayu', 'Dedi', 'Dimas', 'Eko', 'Fajar', 'Gilang', 'Heri', 'Agus', 'Budi'];
+    const lastNames = ['Nugraha', 'Wira', 'Saputra', 'Pratama', 'Hidayat', 'Kurniawan', 'Santoso', 'Wijaya'];
+    const randomName = `${firstNames[Math.floor(Math.random() * firstNames.length)]} ${lastNames[Math.floor(Math.random() * lastNames.length)]}`;
+    const randomPhone = '812' + Math.floor(10000000 + Math.random() * 90000000);
+
+    const fillByLabel = async (labelText, value, inputSelector = 'input') => {
+      try {
+        const formItem = this.page.locator('.ant-form-item').filter({ hasText: new RegExp(`^${labelText}`) });
+        if (await formItem.count() > 0) {
+          const input = formItem.first().locator(inputSelector);
+          if (await input.count() > 0) {
+            await input.first().fill(value);
+            await this.page.waitForTimeout(150);
+            return true;
+          }
+        }
+      } catch {}
+      return false;
+    };
+
+    await this.page.waitForSelector('.ant-form-item', { timeout: 10000 });
+    await this.page.waitForTimeout(1000);
+
+    // Fill fields
+    await fillByLabel('Your name', randomName);
+    await fillByLabel('Email', email);
+    await fillByLabel('Company name', 'SignalStack');
+
+    // Phone prefix
+    try {
+      const selector = this.page.locator('.ant-form-item').filter({ hasText: /^Phone number/ }).locator('.ant-select-selector, .ant-dropdown-trigger');
+      if (await selector.count() > 0) {
+        await selector.first().click({ force: true });
+        await this.page.waitForTimeout(1500);
+        await this.page.evaluate(() => {
+          const dropdowns = Array.from(document.querySelectorAll('.ant-select-dropdown, .ant-dropdown')).filter(el => el.offsetHeight > 0);
+          if (dropdowns.length > 0) {
+            const opts = Array.from(dropdowns[dropdowns.length - 1].querySelectorAll('.ant-select-item-option, li'));
+            const target = opts.find(o => (o.textContent || '').includes('+62'));
+            if (target) target.click();
+          }
+        });
+        await this.page.waitForTimeout(1000);
+      }
+      const phoneInput = this.page.locator('.ant-form-item').filter({ hasText: /^Phone number/ }).locator('input[placeholder="Please enter"]');
+      if (await phoneInput.count() > 0) await phoneInput.first().fill(randomPhone);
+    } catch {}
+
+    // Dropdowns
+    const selectDropdown = async (labelText, searchText) => {
+      try {
+        const formItem = this.page.locator('.ant-form-item').filter({ hasText: new RegExp(`^${labelText}`) });
+        const selector = formItem.first().locator('.ant-select-selector');
+        await selector.click({ force: true });
+        await this.page.waitForTimeout(1500);
+        await this.page.evaluate((search) => {
+          const dropdowns = Array.from(document.querySelectorAll('.ant-select-dropdown')).filter(el => el.offsetHeight > 0);
+          if (dropdowns.length > 0) {
+            const opts = Array.from(dropdowns[dropdowns.length - 1].querySelectorAll('.ant-select-item-option'));
+            const target = opts.find(o => (o.textContent || '').trim() === search || (o.textContent || '').includes(search));
+            if (target) target.click();
+          }
+        }, searchText);
+        await this.page.waitForTimeout(1000);
+      } catch {}
+    };
+
+    await selectDropdown('Industry', 'Finance');
+    await selectDropdown('Your use case', 'Latency-critical');
+
+    // Textarea
+    const shareText = `Building automated trading systems that need to process market data and execute decisions in milliseconds. We use LLMs for risk assessment, sentiment analysis on news feeds, and generating trade rationale in real time. Exploring MiMo UltraSpeed for latency-critical inference. Running about 40k calls daily.`;
+    try {
+      const textarea = this.page.locator('textarea').first();
+      if (await textarea.count() > 0) await textarea.fill(shareText);
+    } catch {}
+
+    await this.page.waitForTimeout(1000);
+
+    // Submit
+    await this.page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+      const submit = btns.find(b => (b.textContent || '').includes('Submit'));
+      if (submit) {
+        submit.scrollIntoView({ block: 'center' });
+        submit.click();
+      }
+    });
+
+    // Handle "Got it" confirmation
+    const gotItBtn = await this.page.waitForSelector('button:has-text("Got it")', { timeout: 6000 }).catch(() => null);
+    if (gotItBtn) {
+      await gotItBtn.click({ force: true });
+      await this.page.waitForTimeout(5000);
+    }
+
+    log(`      ├─ ✓ Ultraspeed form submitted`);
+  }
+
+  // ── Helper: Handle OAuth Redirect ──
+  async handleOAuthRedirect() {
+    const currentUrl = this.page.url();
+    if (currentUrl.includes('account.xiaomi.com') || currentUrl.includes('login') || currentUrl.includes('auth')) {
+      log(`      ├─ OAuth redirect detected...`);
+      await this.page.waitForTimeout(2000);
+      const agreeBtn = await this.page.$('button:has-text("Agree")');
+      if (agreeBtn) {
+        await agreeBtn.click({ force: true });
+        await this.page.waitForTimeout(3000);
+      }
+      const authBtn = await this.page.waitForSelector(
+        'button:has-text("Agree"), button:has-text("Authorize"), #accept', { timeout: 10000 }
+      ).catch(() => null);
+      if (authBtn) {
+        await authBtn.click();
+        await this.page.waitForNavigation({ waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
+        await this.page.waitForTimeout(3000);
+      }
+    }
+  }
+
+  // ── Helper: Accept Cookies ──
+  async acceptCookies() {
+    const btn = await this.page.waitForSelector('button:has-text("Accept All"), button:has-text("Accept")', { timeout: 4000 }).catch(() => null);
+    if (btn) {
+      await btn.click({ force: true }).catch(() => {});
+      await this.page.waitForTimeout(2000);
+    }
+  }
+
+  // ── Run all post-reg steps ──
+  async run(email) {
+    try {
+      await this.launch();
+
+      // 1. SSO login
+      await this.ssoLogin();
+      await humanDelay(2000, 4000);
+
+      // 2. Accept agreement
+      await this.acceptAgreement();
+      await humanDelay(1000, 2000);
+
+      // 3. Refresh session
+      await this.context.addCookies([
+        { name: 'passToken', value: this.passToken, domain: 'account.xiaomi.com', path: '/' },
+        { name: 'userId', value: this.userId, domain: 'account.xiaomi.com', path: '/' },
+      ]);
+      await this.page.goto('https://platform.xiaomimimo.com/console', {
+        waitUntil: 'networkidle', timeout: 60000
+      });
+      await humanDelay(2000, 4000);
+
+      // 4. Redeem invite code
+      try {
+        await this.redeemInviteCode();
+      } catch (e) {
+        log(`      ├─ ! Redeem error: ${e.message.slice(0, 80)}`);
+      }
+
+      // 5. Get referral code (for chain)
+      try {
+        await this.getReferralCode();
+      } catch (e) {
+        log(`      ├─ ! getRefCode error: ${e.message.slice(0, 80)}`);
+      }
+
+      // 6. Create API key
+      if (CREATE_API_KEY_FLAG) {
+        try {
+          await this.createApiKey();
+        } catch (e) {
+          log(`      ├─ ! createApiKey error: ${e.message.slice(0, 80)}`);
+        }
+      }
+
+      // 7. Ultraspeed form
+      if (ULTRASPEED_FORM) {
+        try {
+          await this.fillUltraspeedForm(email);
+        } catch (e) {
+          log(`      ├─ ! Ultraspeed error: ${e.message.slice(0, 80)}`);
+        }
+      }
+
+      return {
+        refCode: this.refCode,
+        apiKey: this.apiKey,
+        balance: this.balance,
+      };
+    } catch (e) {
+      log(`      └─ ❌ Post-reg error: ${e.message}`);
+      return { refCode: null, apiKey: null, balance: null, error: e.message };
+    } finally {
+      await this.close();
+    }
   }
 }
 
-// ─── Telegram Notifier ───
-async function notifyTelegram(email, password, status, ts) {
+// ══════════════════════════════════════════════════════════════════════════
+// TELEGRAM NOTIFIER
+// ══════════════════════════════════════════════════════════════════════════
+
+async function notifyTelegram(email, password, status, ts, extra = {}) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  const msg = [
+  const lines = [
     `✅ *Xiaomi Account Registered*`, ``,
     `📧 Email: \`${email}\``, `🔑 Password: \`${password}\``,
-    `🎯 Referral: \`${REFERRAL_CODE}\``, `📊 Status: ${status}`, `🕐 ${ts}`
-  ].join('\n');
+    `🎯 Referral: \`${extra.inviteCode || REFERRAL_CODE}\``,
+    `📊 Status: ${status}`, `🕐 ${ts}`,
+  ];
+  if (extra.refCode) lines.push(`🔗 RefCode: \`${extra.refCode}\``);
+  if (extra.apiKey) lines.push(`🔑 API Key: \`${extra.apiKey}\``);
+  if (extra.balance !== null && extra.balance !== undefined) lines.push(`💰 Balance: $${extra.balance.toFixed(2)}`);
   try {
     const r = await proxyFetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg, parse_mode: 'Markdown' })
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: lines.join('\n'), parse_mode: 'Markdown' })
     });
     const j = await r.json();
     log(j.ok ? '   📲 Telegram notified' : '   ⚠️  Telegram error: ' + JSON.stringify(j).slice(0, 80));
   } catch (e) { log('   ⚠️  Telegram failed: ' + e.message); }
 }
 
-// ─── Email Name Generator ───
+// ══════════════════════════════════════════════════════════════════════════
+// EMAIL NAME GENERATOR
+// ══════════════════════════════════════════════════════════════════════════
+
 const NAME_POOLS = {
   UK: ['james', 'oliver', 'harry', 'george', 'noah', 'jack', 'leo', 'oscar', 'charlie', 'henry',
     'olivia', 'amelia', 'isla', 'ava', 'mia', 'isabella', 'sophia', 'grace', 'lily', 'freddie'],
@@ -568,7 +1260,7 @@ const NAME_POOLS = {
   SG: ['aaron', 'bryan', 'daniel', 'ethan', 'gabriel', 'ian', 'jason', 'kevin', 'leon', 'marcus',
     'amanda', 'beth', 'claire', 'diana', 'elaine', 'fiona', 'grace', 'hannah', 'irene', 'jane'],
   ID: ['andi', 'budi', 'dika', 'eka', 'fajar', 'gilang', 'hadi', 'ivan', 'joko', 'kurnia',
-    'aisyah', 'bella', 'citra', 'dewi', 'eni', 'fitri', 'gita', 'hani', 'indah', 'julia']
+    'aisyah', 'bella', 'citra', 'dewi', 'eni', 'fitri', 'gita', 'hani', 'indah', 'julia'],
 };
 const REGIONS = Object.keys(NAME_POOLS);
 
@@ -577,11 +1269,8 @@ function generateHumanEmail(index) {
   const pool = NAME_POOLS[region];
   const first = pool[Math.floor(Math.random() * pool.length)];
   const last = pool[Math.floor(Math.random() * pool.length)];
-  // Various human-like patterns
   const patterns = [
-    `${first}.${last}`,
-    `${first}${last}`,
-    `${first}_${last}`,
+    `${first}.${last}`, `${first}${last}`, `${first}_${last}`,
     `${first}${Math.floor(Math.random() * 90 + 10)}`,
     `${first}${String.fromCharCode(97 + Math.floor(Math.random() * 26))}${Math.floor(Math.random() * 90 + 10)}`,
     `${first}.${last}${Math.floor(Math.random() * 99 + 1)}`,
@@ -590,8 +1279,11 @@ function generateHumanEmail(index) {
   return { email: `${local}@${pickDomain()}`, region };
 }
 
-// ─── Register one account ───
-async function registerOne(index, totalCount) {
+// ══════════════════════════════════════════════════════════════════════════
+// REGISTER ONE ACCOUNT (HTTP registration + Playwright post-reg)
+// ══════════════════════════════════════════════════════════════════════════
+
+async function registerOne(index, totalCount, inviteCode) {
   const ts = new Date().toISOString();
   const { email, region } = generateHumanEmail(index);
   const password = PASSWORD;
@@ -599,8 +1291,10 @@ async function registerOne(index, totalCount) {
   log(``);
   log(`┌─────────────────────────────────────────────────`);
   log(`│ 📧 [${index + 1}/${totalCount}] ${email}  (${region})`);
+  if (chainMode) log(`│ 🔗 Invite code: ${inviteCode}`);
   log(`└─────────────────────────────────────────────────`);
 
+  // ── Phase A: HTTP Registration ──
   const vToken = await getCaptchaToken();
   if (!vToken) { log('   ❌ Captcha failed after 4 attempts'); return { email, password, status: 'FAILED_CAPTCHA', ts }; }
 
@@ -612,23 +1306,45 @@ async function registerOne(index, totalCount) {
   }
   log('   ✅ Email sent');
 
-  log('   📬 Waiting for verification code... (120s timeout)');
+  log('   📬 Waiting for verification code... (300s timeout)');
   const code = await readCode(email, 300);
   if (!code) { log('   ❌ Code timeout — no email received'); return { email, password, status: 'FAILED_CODE_TIMEOUT', ts }; }
   log('   🔑 Code: ' + code);
 
   log('   🔄 Verifying account...');
   const result = await verifyAccount(email, password, code);
-  if (result.code === 0) {
-    log('   ✅ Account created successfully!');
-    await notifyTelegram(email, password, 'SUCCESS', ts);
-    return { email, password, status: 'SUCCESS', referral: REFERRAL_CODE, referralStatus: 'PENDING', ts, passToken: result.passToken || '', serviceToken: result.serviceToken || '', userId: result.userId || result.cUserId || '' };
+  if (result.code !== 0) {
+    log('   ❌ Verify failed: ' + (result.reason || result.desc || 'unknown'));
+    return { email, password, status: 'FAILED_VERIFY: ' + (result.reason || ''), ts };
   }
-  log('   ❌ Verify failed: ' + (result.reason || result.desc || 'unknown'));
-  return { email, password, status: 'FAILED_VERIFY: ' + (result.reason || ''), ts };
+  log('   ✅ Account created!');
+
+  const passToken = result.passToken || '';
+  const userId = result.userId || result.cUserId || '';
+
+  // ── Phase B: Playwright Post-Registration ──
+  let postRegResult = { refCode: null, apiKey: null, balance: null };
+  if (passToken) {
+    log('   🌐 Post-registration session...');
+    const session = new PostRegSession(passToken, userId, inviteCode);
+    postRegResult = await session.run(email);
+  }
+
+  await notifyTelegram(email, password, 'SUCCESS', ts, {
+    inviteCode, refCode: postRegResult.refCode, apiKey: postRegResult.apiKey, balance: postRegResult.balance
+  });
+
+  return {
+    email, password, status: 'SUCCESS',
+    referral: inviteCode, ts, passToken, serviceToken: result.serviceToken || '',
+    userId, refCode: postRegResult.refCode, apiKey: postRegResult.apiKey, balance: postRegResult.balance,
+  };
 }
 
-// ─── Logger ───
+// ══════════════════════════════════════════════════════════════════════════
+// LOGGER
+// ══════════════════════════════════════════════════════════════════════════
+
 const LOG_LINES = [];
 const C = {
   reset: '\x1b[0m', dim: '\x1b[2m',
@@ -639,36 +1355,51 @@ const C = {
 function log(msg) {
   const ts = new Date().toISOString().slice(11, 19);
   const plain = `[${ts}] ${msg}`;
-  // Colorize: green for success markers, red for failures, cyan for info
   let colored = `${C.dim}[${ts}]${C.reset} ${msg}`;
   if (msg.includes('✅') || msg.includes('✓')) colored = `${C.dim}[${ts}]${C.reset} ${C.green}${msg}${C.reset}`;
   else if (msg.includes('❌') || msg.includes('✗')) colored = `${C.dim}[${ts}]${C.reset} ${C.red}${msg}${C.reset}`;
-  else if (msg.includes('⚠️')) colored = `${C.dim}[${ts}]${C.reset} ${C.yellow}${msg}${C.reset}`;
-  else if (msg.includes('🔄') || msg.includes('🔐') || msg.includes('📧') || msg.includes('📬')) colored = `${C.dim}[${ts}]${C.reset} ${C.cyan}${msg}${C.reset}`;
+  else if (msg.includes('⚠️') || msg.includes('⚠')) colored = `${C.dim}[${ts}]${C.reset} ${C.yellow}${msg}${C.reset}`;
+  else if (msg.includes('🔄') || msg.includes('🔐') || msg.includes('📧') || msg.includes('📬') || msg.includes('🌐')) colored = `${C.dim}[${ts}]${C.reset} ${C.cyan}${msg}${C.reset}`;
   console.log(colored);
   LOG_LINES.push(plain);
 }
 
-// ─── Main ───
+// ══════════════════════════════════════════════════════════════════════════
+// MAIN
+// ══════════════════════════════════════════════════════════════════════════
+
 async function main() {
-  const count = parseInt(process.argv[2]) || parseInt(COUNT) || 5;
   console.log(`\n${C.bold}${C.cyan}╔══════════════════════════════════════════════════╗${C.reset}`);
-  console.log(`${C.bold}${C.cyan}║${C.reset}${C.bold}   XIAOMI BULK REGISTRATION BOT                  ${C.cyan}║${C.reset}`);
+  console.log(`${C.bold}${C.cyan}║${C.reset}${C.bold}   XIAOMI BULK REGISTRATION BOT v2.0             ${C.cyan}║${C.reset}`);
+  console.log(`${C.bold}${C.cyan}║${C.reset}   Chain Referral + API Key + Ultraspeed          ${C.cyan}║${C.reset}`);
   console.log(`${C.bold}${C.cyan}╚══════════════════════════════════════════════════╝${C.reset}`);
   console.log();
   log(`📋 Config`);
-  log(`   Domains  : ${DOMAINS.join(', ')}`);
-  log(`   Gmail    : ${GMAIL_USER}`);
-  log(`   Referral : ${REFERRAL_CODE || 'none'} (humanized delay)`);
-  log(`   Accounts : ${count}`);
-  log(`   Proxy    : ${PROXY_URL ? 'enabled' : 'disabled'}`);
+  log(`   Domains     : ${DOMAINS.join(', ')}`);
+  log(`   Gmail       : ${GMAIL_USER}`);
+  log(`   Accounts    : ${count}`);
+  log(`   Chain mode  : ${chainMode ? '✅ ON' : '❌ OFF'}`);
+  if (chainMode) log(`   Seed invite : ${CHAIN_SEED}`);
+  log(`   API key     : ${CREATE_API_KEY_FLAG ? '✅ ON' : '❌ OFF'}`);
+  log(`   Ultraspeed  : ${ULTRASPEED_FORM ? '✅ ON' : '❌ OFF'}`);
+  log(`   Proxy       : ${PROXY_URL ? 'enabled' : 'disabled'}`);
   log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
 
-  // ── Phase 1: Register all accounts ──
   const results = [];
+  let currentInviteCode = chainMode ? CHAIN_SEED : REFERRAL_CODE;
+
   for (let i = 0; i < count; i++) {
     try {
-      results.push(await registerOne(i, count));
+      const result = await registerOne(i, count, currentInviteCode);
+      results.push(result);
+
+      // Chain: pass refCode to next iteration
+      if (chainMode && result.status === 'SUCCESS' && result.refCode) {
+        log(`\n   🔗 Chain: next iteration will use refCode ${result.refCode}`);
+        currentInviteCode = result.refCode;
+      } else if (chainMode && result.status === 'SUCCESS' && !result.refCode) {
+        log(`\n   ⚠️  Chain broken: no refCode captured. Using same invite code.`);
+      }
     } catch (e) {
       log('   ❌ EXCEPTION: ' + e.message);
       results.push({ email: `batch_${i}@${pickDomain()}`, password: PASSWORD, status: 'ERROR: ' + e.message, ts: new Date().toISOString() });
@@ -676,90 +1407,21 @@ async function main() {
     if (i < count - 1) await sleep(3000);
   }
 
+  // ── Results Summary ──
   log(``);
   log(`╔══════════════════════════════════════════════════`);
-  log(`║ 📊 REGISTRATION RESULTS`);
+  log(`║ 📊 RESULTS`);
   log(`╚══════════════════════════════════════════════════`);
   for (const r of results) {
     const icon = r.status === 'SUCCESS' ? '✅' : '❌';
-    log(`   ${icon} ${r.email}`);
+    log(`   ${icon} ${r.email}${r.refCode ? ` → ref:${r.refCode}` : ''}${r.apiKey ? ` key:${r.apiKey.slice(0, 12)}...` : ''}`);
     if (r.status !== 'SUCCESS') log(`      └─ ${r.status}`);
   }
   const ok = results.filter(r => r.status === 'SUCCESS').length;
   log(``);
   log(`   📈 Total: ${ok}/${count} success`);
 
-  // ── Phase 2: Deferred referral binding (humanized delays) ──
-  const pendingRefs = results.filter(r => r.status === 'SUCCESS' && r.passToken && REFERRAL_CODE);
-  if (pendingRefs.length > 0) {
-    log(``);
-    log(`╔══════════════════════════════════════════════════`);
-    log(`║ 🎯 REFERRAL PHASE — ${pendingRefs.length} accounts`);
-    log(`║    Humanized delays (3-8min base + jitter)`);
-    log(`╚══════════════════════════════════════════════════`);
-
-    let consecutiveFails = 0;
-    for (let i = 0; i < pendingRefs.length; i++) {
-      const r = pendingRefs[i];
-
-      // Humanized delay: base 3-8min + jitter, longer if consecutive fails
-      let baseDelay;
-      if (i === 0) {
-        baseDelay = 30 + Math.floor(Math.random() * 60); // first one: 30-90s
-      } else if (consecutiveFails >= 3) {
-        // Cooling off: 10-20min after 3+ consecutive failures
-        baseDelay = 600 + Math.floor(Math.random() * 600);
-        log(`   🧊 Cooling off after ${consecutiveFails} fails...`);
-      } else {
-        // Normal: 3-8 min base + random jitter
-        baseDelay = 180 + Math.floor(Math.random() * 300) + Math.floor(Math.random() * 120);
-      }
-
-      // Every 5th account: take a longer "human break" (8-15min)
-      if (i > 0 && i % 5 === 0) {
-        const breakTime = 480 + Math.floor(Math.random() * 420);
-        log(`   ☕ Human break #${Math.floor(i / 5)} — ${Math.floor(breakTime / 60)}min...`);
-        await sleep(breakTime * 1000);
-      }
-
-      log(``);
-      log(`   🎯 [${i + 1}/${pendingRefs.length}] ${r.email}`);
-      log(`   ⏳ Waiting ${Math.floor(baseDelay / 60)}m ${baseDelay % 60}s before bind...`);
-      await sleep(baseDelay * 1000);
-
-      // Random "thinking" pause before actual bind (2-8s)
-      await sleep(2000 + Math.floor(Math.random() * 6000));
-
-      log(`   🔄 Binding referral ${REFERRAL_CODE}...`);
-      try {
-        const refResult = await applyReferral(r.passToken, r.userId);
-        const bindBody = refResult.body ? JSON.parse(refResult.body) : refResult;
-        if (refResult.status === 200 || bindBody?.code === 0) {
-          r.referralStatus = 'SUCCESS';
-          consecutiveFails = 0;
-          log('   ✅ Referral bound successfully!');
-        } else {
-          r.referralStatus = `FAILED: ${refResult.status || ''} ${bindBody?.code || ''}`;
-          consecutiveFails++;
-          log('   ❌ Referral failed: ' + JSON.stringify(bindBody).slice(0, 120));
-        }
-      } catch (e) {
-        r.referralStatus = 'ERROR: ' + e.message;
-        consecutiveFails++;
-        log('   ❌ Referral error: ' + e.message);
-      }
-    }
-
-    log(``);
-    log(`┌─────────────────────────────────────────────────`);
-    log(`│ 🎯 REFERRAL RESULTS`);
-    log(`└─────────────────────────────────────────────────`);
-    for (const r of pendingRefs) {
-      const icon = r.referralStatus === 'SUCCESS' ? '✅' : '❌';
-      log(`   ${icon} ${r.email} — ${r.referralStatus}`);
-    }
-  }
-
+  // ── Save Results ──
   log(``);
   log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   log(`💾 Saving results...`);
@@ -768,7 +1430,6 @@ async function main() {
   fs.writeFileSync(resolve(__dirname, 'results.json'), JSON.stringify(results, null, 2));
   log(`   ├─ results.json`);
 
-  // Append successful accounts to success.json (accumulative across runs)
   const successPath = resolve(__dirname, 'success.json');
   let existingSuccess = [];
   try { existingSuccess = JSON.parse(fs.readFileSync(successPath, 'utf8')); } catch {}
@@ -779,7 +1440,6 @@ async function main() {
     log(`   ├─ success.json (+${newSuccess.length}, total: ${existingSuccess.length})`);
   }
 
-  // Save log to logs/ directory
   const logsDir = resolve(__dirname, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);

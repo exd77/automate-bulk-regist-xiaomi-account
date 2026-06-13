@@ -1,14 +1,17 @@
 {
-  "name": "xiaomi",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "xiaomi-mimo-autoreg",
+  "version": "2.0.0",
+  "description": "Xiaomi MiMo Bulk Registration Bot — Chain Referral Edition",
+  "type": "module",
+  "main": "register.mjs",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node register.mjs",
+    "chain": "node register.mjs --chain",
+    "test": "node --check register.mjs && echo 'Syntax OK'"
   },
-  "keywords": [],
+  "keywords": ["xiaomi", "mimo", "automation", "registration", "chain-referral"],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "imapflow": "^1.4.0",
     "node-forge": "^1.4.0",
